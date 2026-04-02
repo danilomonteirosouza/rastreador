@@ -11,10 +11,13 @@
  *  - ACK MQTT ao receber e executar comando
  *  - pausa de GPS e reconexões após chegada de mensagem MQTT
  *  - uma vez conectada uma rede, não tenta outra enquanto a ativa estiver saudável
+ *  - parser de CGNSSINFO corrigido para o formato real do A7670E
+ *  - publicação do GPS no formato:
+ *      latitude: xxxx, longitude: xxxx
  */
 
 #define TINY_GSM_RX_BUFFER 1024
-#define TINY_GSM_MODEM_SIM7600
+#define TINY_GSM_MODEM_A7670
 
 #include "utilities.h"
 #include <TinyGsmClient.h>
@@ -167,7 +170,9 @@ GpsPublishState gpsState = GPS_IDLE;
 unsigned long gpsStateStartedAt = 0;
 unsigned long gpsNextReadAt = 0;
 int gpsAttemptCount = 0;
-const int gpsMaxAttempts = 10;
+const int gpsMaxAttempts = 60;
+const unsigned long gpsInitialWaitMs = 30000UL;
+const unsigned long gpsRetryWaitMs = 5000UL;
 double gpsLat = 0.0;
 double gpsLon = 0.0;
 
@@ -1046,27 +1051,51 @@ void superviseNetwork() {
 // ------------------------------------------------------------
 // GPS
 // ------------------------------------------------------------
-double convertNmeaToDecimal(const String& raw, char hemi) {
-  if (raw.length() < 4) return 0.0;
+bool gpsPowerOff() {
+  String resp;
 
-  int dot = raw.indexOf('.');
-  if (dot < 0) return 0.0;
+  if (!sendATGetResponse("AT+CGNSSPWR=0", resp, 1500)) {
+    logWarn("Sem resposta ao desligar GNSS");
+    return false;
+  }
 
-  int degLen = (dot > 4) ? 3 : 2;
-  double degrees = raw.substring(0, degLen).toDouble();
-  double minutes = raw.substring(degLen).toDouble();
+  resp.replace("\r", " ");
+  resp.replace("\n", " | ");
+  logInfo("Resposta desligamento GNSS: " + resp);
+  return true;
+}
 
-  double decimal = degrees + (minutes / 60.0);
+bool gpsSetMode() {
+  String resp;
 
-  if (hemi == 'S' || hemi == 'W') decimal = -decimal;
+  if (!sendATGetResponse("AT+CGNSSMODE=1", resp, 1500)) {
+    logWarn("Sem resposta ao configurar modo GNSS");
+    return false;
+  }
 
-  return decimal;
+  resp.replace("\r", " ");
+  resp.replace("\n", " | ");
+  logInfo("Resposta modo GNSS: " + resp);
+
+  if (resp.indexOf("OK") >= 0) {
+    logOk("Modo GNSS configurado");
+    return true;
+  }
+
+  logWarn("Modo GNSS sem confirmação de OK");
+  return false;
 }
 
 bool gpsPowerOn() {
   String resp;
 
-  if (!sendATGetResponse("AT+CGNSSPWR=1", resp, 1200)) {
+  gpsPowerOff();
+  delay(500);
+
+  gpsSetMode();
+  delay(300);
+
+  if (!sendATGetResponse("AT+CGNSSPWR=1", resp, 2000)) {
     logErr("Sem resposta ao ligar GNSS");
     return false;
   }
@@ -1074,6 +1103,11 @@ bool gpsPowerOn() {
   resp.replace("\r", " ");
   resp.replace("\n", " | ");
   logInfo("Resposta GNSS: " + resp);
+
+  logATCommand("AT+CGNSSPWR?", 1500);
+  logATCommand("AT+CGNSSMODE?", 1500);
+  logATCommand("AT+CGPSINFO", 2000);
+  logATCommand("AT+CGNSSINFO", 2000);
 
   if (resp.indexOf("OK") >= 0 || resp.indexOf("READY") >= 0) {
     logOk("GNSS habilitado");
@@ -1087,7 +1121,7 @@ bool gpsPowerOn() {
 bool readGps(double& lat, double& lon) {
   String resp;
 
-  if (!sendATGetResponse("AT+CGNSSINFO", resp, 1200)) {
+  if (!sendATGetResponse("AT+CGNSSINFO", resp, 2500)) {
     logErr("Sem resposta do GNSS");
     return false;
   }
@@ -1100,6 +1134,7 @@ bool readGps(double& lat, double& lon) {
   int idx = resp.indexOf("+CGNSSINFO:");
   if (idx < 0) {
     logErr("Resposta GNSS sem marcador +CGNSSINFO");
+    logATCommand("AT+CGPSINFO", 2000);
     return false;
   }
 
@@ -1112,8 +1147,8 @@ bool readGps(double& lat, double& lon) {
   payload.replace("+CGNSSINFO:", "");
   payload.trim();
 
-  if (payload.length() == 0 || payload == ",,,,,,,," || payload.indexOf(",,,,") >= 0) {
-    logWarn("GNSS ainda sem fix");
+  if (payload.length() == 0) {
+    logWarn("GNSS sem payload útil");
     return false;
   }
 
@@ -1123,28 +1158,52 @@ bool readGps(double& lat, double& lon) {
 
   for (int i = 0; i <= payload.length(); i++) {
     if (i == payload.length() || payload.charAt(i) == ',') {
-      if (fieldCount < 20) fields[fieldCount++] = payload.substring(start, i);
+      if (fieldCount < 20) {
+        fields[fieldCount++] = payload.substring(start, i);
+      }
       start = i + 1;
     }
   }
 
-  if (fieldCount < 6) {
+  if (fieldCount < 9) {
     logErr("Campos GNSS insuficientes");
     return false;
   }
 
-  String latRaw = fields[2];
-  String latHem = fields[3];
-  String lonRaw = fields[4];
-  String lonHem = fields[5];
+  // Formato real observado no seu A7670E:
+  // 0=run status
+  // 1=fix status
+  // 2=UTC vazio em alguns casos
+  // 3=GNSS sats
+  // 4=fix mode
+  // 5=latitude decimal
+  // 6=hemisferio latitude
+  // 7=longitude decimal
+  // 8=hemisferio longitude
+
+  String latRaw = fields[5];
+  String latHem = fields[6];
+  String lonRaw = fields[7];
+  String lonHem = fields[8];
 
   if (latRaw.length() == 0 || latHem.length() == 0 || lonRaw.length() == 0 || lonHem.length() == 0) {
-    logWarn("GNSS sem latitude/longitude válidas");
+    logWarn("GNSS ligado, porém ainda sem coordenadas válidas");
     return false;
   }
 
-  lat = convertNmeaToDecimal(latRaw, latHem.charAt(0));
-  lon = convertNmeaToDecimal(lonRaw, lonHem.charAt(0));
+  lat = latRaw.toDouble();
+  lon = lonRaw.toDouble();
+
+  if (latHem == "S") lat = -lat;
+  if (latHem == "N") lat =  lat;
+
+  if (lonHem == "W") lon = -lon;
+  if (lonHem == "E") lon =  lon;
+
+  if (lat == 0.0 && lon == 0.0) {
+    logWarn("GNSS retornou coordenadas zeradas");
+    return false;
+  }
 
   return true;
 }
@@ -1155,15 +1214,8 @@ bool publishGpsPayload(double lat, double lon) {
     return false;
   }
 
-  String payload = "{";
-  payload += "\"type\":\"gps\",";
-  payload += "\"lat\":" + String(lat, 6) + ",";
-  payload += "\"lon\":" + String(lon, 6) + ",";
-  payload += "\"source\":\"A7670E\",";
-  payload += "\"network\":\"";
-  payload += usingGsm ? "4G" : "WiFi";
-  payload += "\"}";
-  
+  String payload = "latitude: " + String(lat, 7) + ", longitude: " + String(lon, 7);
+
   payload.toCharArray(bufferMessage, MSG_BUFFER_SIZE);
 
   logInfo("Payload GPS: " + payload);
@@ -1203,12 +1255,15 @@ void processGpsPublisher() {
   switch (gpsState) {
     case GPS_POWER_ON:
       logInfo("Ativando GNSS para novo ciclo");
+
       if (!gpsPowerOn()) {
         logErr("Falha ao ativar GNSS neste ciclo");
         gpsState = GPS_IDLE;
         return;
       }
-      gpsNextReadAt = millis() + 1500UL;
+
+      logInfo("GNSS ligado. Aguardando janela inicial para primeiro fix");
+      gpsNextReadAt = millis() + gpsInitialWaitMs;
       gpsState = GPS_WAIT_BEFORE_READ;
       return;
 
@@ -1222,21 +1277,27 @@ void processGpsPublisher() {
       gpsAttemptCount++;
       logInfo("Tentativa de leitura GPS " + String(gpsAttemptCount) + "/" + String(gpsMaxAttempts));
 
+      if ((gpsAttemptCount == 1) || (gpsAttemptCount % 5 == 0)) {
+        logATCommand("AT+CGNSSPWR?", 1500);
+        logATCommand("AT+CGPSINFO", 2000);
+      }
+
       if (readGps(gpsLat, gpsLon)) {
         logOk("GPS com coordenadas válidas");
-        logInfo("Latitude: " + String(gpsLat, 6));
-        logInfo("Longitude: " + String(gpsLon, 6));
+        logInfo("Latitude: " + String(gpsLat, 7));
+        logInfo("Longitude: " + String(gpsLon, 7));
         gpsState = GPS_PUBLISH;
         return;
       }
 
       if (gpsAttemptCount >= gpsMaxAttempts) {
-        logErr("Não foi possível obter fix GPS após várias tentativas");
+        logErr("Não foi possível obter GPS após várias tentativas");
+        logWarn("GNSS permaneceu ligado, mas sem coordenadas válidas durante todo o ciclo");
         gpsState = GPS_IDLE;
         return;
       }
 
-      gpsNextReadAt = millis() + 5000UL;
+      gpsNextReadAt = millis() + gpsRetryWaitMs;
       gpsState = GPS_WAIT_BEFORE_READ;
       return;
 
