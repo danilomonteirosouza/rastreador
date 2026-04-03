@@ -109,9 +109,9 @@ struct ApnConfig {
 };
 
 ApnConfig apns[] = {
+  { "VIVO",  "zap.vivo.com.br",   "vivo",  "vivo"  },
   { "TIM",   "timbrasil.br",      "tim",   "tim"   },
-  { "CLARO", "java.claro.com.br", "Claro", "Claro" },
-  { "VIVO",  "zap.vivo.com.br",   "vivo",  "vivo"  }
+  { "CLARO", "java.claro.com.br", "Claro", "Claro" }
 };
 
 const int APN_COUNT = sizeof(apns) / sizeof(apns[0]);
