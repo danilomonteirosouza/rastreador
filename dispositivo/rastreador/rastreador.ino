@@ -14,6 +14,11 @@
  *  - parser de CGNSSINFO corrigido para o formato real do A7670E
  *  - publicação do GPS no formato:
  *      latitude: xxxx, longitude: xxxx
+ *  - preparo do rádio antes do registro da rede
+ *  - seleção automática de operadora antes do attach
+ *  - recuperação do rádio ao detectar CSQ=99
+ *  - limpeza extra do estado de rede antes da APN
+ *  - logs extras para diagnóstico do registro móvel
  */
 
 #define TINY_GSM_RX_BUFFER 1024
@@ -377,6 +382,28 @@ bool sendATGetResponse(const String& cmd, String& response, uint32_t timeout = 1
   return response.length() > 0;
 }
 
+bool sendATExpectOk(const String& cmd, uint32_t timeout = 2000) {
+  String resp;
+  if (!sendATGetResponse(cmd, resp, timeout)) {
+    logWarn("Sem resposta para " + cmd);
+    return false;
+  }
+
+  String logResp = resp;
+  logResp.replace("\r", " ");
+  logResp.replace("\n", " | ");
+  logInfo(cmd + " => " + logResp);
+
+  String upper = resp;
+  upper.toUpperCase();
+
+  if (upper.indexOf("OK") >= 0) {
+    return true;
+  }
+
+  return false;
+}
+
 void logATCommand(const String& cmd, uint32_t timeout = 2000) {
   String resp;
   bool ok = sendATGetResponse(cmd, resp, timeout);
@@ -427,6 +454,7 @@ void logATSnapshotCompleto() {
   logATCommand("AT+CEREG?", 1200);
   logATCommand("AT+COPS?", 2000);
   logATCommand("AT+CGATT?", 1200);
+  logATCommand("AT+CGACT?", 2000);
   logATCommand("AT+CGPADDR", 2000);
 }
 
@@ -586,6 +614,157 @@ bool waitForSimReady(unsigned long timeoutMs = 60000UL) {
 }
 
 // ------------------------------------------------------------
+// REDE - APOIO
+// ------------------------------------------------------------
+void logDetailedRegistrationSnapshot() {
+  logStep("DIAGNOSTICO DE REGISTRO");
+  logATCommand("AT+CSQ", 1200);
+  logATCommand("AT+CREG?", 1200);
+  logATCommand("AT+CGREG?", 1200);
+  logATCommand("AT+CEREG?", 1200);
+  logATCommand("AT+COPS?", 2500);
+  logATCommand("AT+CGATT?", 1200);
+  logATCommand("AT+CGACT?", 2000);
+  logATCommand("AT+CGPADDR", 2000);
+}
+
+bool configureRadioBeforeRegistration() {
+  logStep("PREPARO DO RADIO");
+
+  bool ok = true;
+
+  if (!sendATExpectOk("AT+CFUN=1", 3000)) {
+    logWarn("AT+CFUN=1 sem confirmação de OK");
+    ok = false;
+  }
+  delay(800);
+
+  if (!sendATExpectOk("AT+CREG=2", 1500)) {
+    logWarn("AT+CREG=2 não confirmado");
+  }
+
+  if (!sendATExpectOk("AT+CGREG=2", 1500)) {
+    logWarn("AT+CGREG=2 não confirmado");
+  }
+
+  if (!sendATExpectOk("AT+CEREG=2", 1500)) {
+    logWarn("AT+CEREG=2 não confirmado");
+  }
+
+  // Tentativa de manter seleção de modo automática.
+  // Alguns firmwares podem rejeitar CNMP e o fluxo segue.
+  if (!sendATExpectOk("AT+CNMP=2", 1500)) {
+    logWarn("AT+CNMP=2 não aceito por este firmware");
+  }
+
+  logATCommand("AT+CFUN?", 1500);
+  logATCommand("AT+CNMP?", 1500);
+  logATCommand("AT+COPS?", 2500);
+
+  return ok;
+}
+
+bool forceAutomaticOperatorSelection() {
+  logStep("SELECAO DE OPERADORA");
+
+  logInfo("Solicitando seleção automática de operadora");
+  bool ok = sendATExpectOk("AT+COPS=0", 15000);
+
+  if (!ok) {
+    logWarn("AT+COPS=0 sem OK. O fluxo seguirá com diagnóstico extra.");
+  }
+
+  delay(1500);
+  logATCommand("AT+COPS?", 2500);
+  return ok;
+}
+
+void disconnectCellularData() {
+  logInfo("Desativando sessão de dados móveis anterior");
+  modem.gprsDisconnect();
+  delay(1000);
+}
+
+bool cleanNetworkStateBeforeApn() {
+  logStep("LIMPEZA DE ESTADO DE REDE");
+
+  bool anyOk = false;
+
+  disconnectCellularData();
+
+  if (sendATExpectOk("AT+CGATT=0", 8000)) {
+    logOk("Detach de pacote executado");
+    anyOk = true;
+  } else {
+    logWarn("AT+CGATT=0 sem confirmação");
+  }
+
+  if (sendATExpectOk("AT+CGACT=0,1", 5000)) {
+    logOk("PDP context CID 1 desativado");
+    anyOk = true;
+  } else {
+    logWarn("AT+CGACT=0,1 sem confirmação");
+  }
+
+  if (sendATExpectOk("AT+COPS=2", 15000)) {
+    logOk("Deregister solicitado");
+    anyOk = true;
+  } else {
+    logWarn("AT+COPS=2 sem confirmação");
+  }
+
+  delay(1200);
+
+  logATCommand("AT+CGATT?", 1200);
+  logATCommand("AT+CGACT?", 2000);
+  logATCommand("AT+COPS?", 2500);
+  logATCommand("AT+CGPADDR", 2000);
+
+  return anyOk;
+}
+
+bool reattachPacketDomain() {
+  logStep("REATTACH DE PACOTE");
+
+  if (!sendATExpectOk("AT+CGATT=1", 10000)) {
+    logWarn("AT+CGATT=1 sem confirmação de OK");
+    logATCommand("AT+CGATT?", 1500);
+    return false;
+  }
+
+  delay(1500);
+  logATCommand("AT+CGATT?", 1500);
+  return true;
+}
+
+bool recoverRadioFromUnknownSignal() {
+  logStep("RECUPERACAO DO RADIO POR CSQ=99");
+
+  bool ok = true;
+
+  logWarn("CSQ=99 persistente. Reiniciando pilha de rádio.");
+
+  if (!sendATExpectOk("AT+CFUN=0", 5000)) {
+    logWarn("AT+CFUN=0 sem confirmação");
+    ok = false;
+  }
+
+  delay(2500);
+
+  if (!sendATExpectOk("AT+CFUN=1", 8000)) {
+    logWarn("AT+CFUN=1 sem confirmação");
+    ok = false;
+  }
+
+  delay(4000);
+
+  forceAutomaticOperatorSelection();
+  logDetailedRegistrationSnapshot();
+
+  return ok;
+}
+
+// ------------------------------------------------------------
 // REDE
 // ------------------------------------------------------------
 void logNetworkSnapshot() {
@@ -611,8 +790,14 @@ bool isCellularLinkHealthy() {
 bool waitForNetworkRegistration(unsigned long timeoutMs = 60000UL) {
   logStep("REGISTRO NA REDE MOVEL");
 
+  configureRadioBeforeRegistration();
+  forceAutomaticOperatorSelection();
+
   unsigned long start = millis();
   unsigned long lastVerbose = 0;
+  int csq99Count = 0;
+  int lastReg = -999;
+  int lastCsq = -999;
 
   while (millis() - start < timeoutMs) {
     dumpModemOutput(80);
@@ -625,17 +810,41 @@ bool waitForNetworkRegistration(unsigned long timeoutMs = 60000UL) {
     int16_t csq = modem.getSignalQuality();
     int reg = modem.getRegistrationStatus();
 
-    logInfo("Sinal CSQ=" + String(csq) + " (" + csqToDbmString(csq) + ")" +
-            " | Registro=" + regStatusToString(reg));
+    if (csq != lastCsq || reg != lastReg) {
+      logInfo("Sinal CSQ=" + String(csq) + " (" + csqToDbmString(csq) + ")" +
+              " | Registro=" + regStatusToString(reg));
+      lastCsq = csq;
+      lastReg = reg;
+    }
 
     if (reg == 1 || reg == 5) {
       logOk("Registro na rede móvel concluído");
       logNetworkSnapshot();
+      logATCommand("AT+COPS?", 2500);
       return true;
+    }
+
+    if (csq == 99) {
+      csq99Count++;
+      logWarn("CSQ=99 detectado (" + String(csq99Count) + "x em sequência)");
+
+      if (csq99Count >= 3) {
+        recoverRadioFromUnknownSignal();
+        csq99Count = 0;
+        delay(1500);
+      }
+    } else {
+      csq99Count = 0;
+    }
+
+    if (reg == 3) {
+      logWarn("Registro negado. Forçando nova seleção automática de operadora.");
+      forceAutomaticOperatorSelection();
     }
 
     if (millis() - lastVerbose > 10000UL) {
       logNetworkSnapshot();
+      logDetailedRegistrationSnapshot();
       lastVerbose = millis();
     }
 
@@ -643,18 +852,13 @@ bool waitForNetworkRegistration(unsigned long timeoutMs = 60000UL) {
   }
 
   logErr("Falha no registro da rede móvel");
+  logDetailedRegistrationSnapshot();
   return false;
 }
 
 // ------------------------------------------------------------
 // DADOS MOVEIS
 // ------------------------------------------------------------
-void disconnectCellularData() {
-  logInfo("Desativando sessão de dados móveis anterior");
-  modem.gprsDisconnect();
-  delay(1000);
-}
-
 bool connectGsmWithApn(const ApnConfig& cfg) {
   if (shouldPauseNonCriticalTasks()) {
     logWarn("Tentativa 4G pausada por prioridade MQTT");
@@ -666,7 +870,7 @@ bool connectGsmWithApn(const ApnConfig& cfg) {
   logInfo("APN: " + String(cfg.apn));
   logInfo("Usuário APN: " + String(cfg.user));
 
-  disconnectCellularData();
+  cleanNetworkStateBeforeApn();
 
   if (shouldPauseNonCriticalTasks()) {
     logWarn("Abertura de 4G pausada por prioridade MQTT");
@@ -683,12 +887,21 @@ bool connectGsmWithApn(const ApnConfig& cfg) {
     return false;
   }
 
+  // Limpeza extra após o registro e antes da abertura da APN.
+  logStep("PRE-APN");
+  disconnectCellularData();
+  sendATExpectOk("AT+CGACT=0,1", 5000);
+  reattachPacketDomain();
+  logATCommand("AT+CGATT?", 1500);
+  logATCommand("AT+CGACT?", 2000);
+
   logInfo("Abrindo contexto de dados móveis");
   bool gprsOk = modem.gprsConnect(cfg.apn, cfg.user, cfg.pass);
 
   if (!gprsOk) {
     logErr("Falha no gprsConnect() para " + String(cfg.operadora));
     logNetworkSnapshot();
+    logDetailedRegistrationSnapshot();
     return false;
   }
 
@@ -702,6 +915,7 @@ bool connectGsmWithApn(const ApnConfig& cfg) {
   if (!modem.isGprsConnected()) {
     logErr("Dados móveis não ficaram ativos em " + String(cfg.operadora));
     logNetworkSnapshot();
+    logDetailedRegistrationSnapshot();
     return false;
   }
 
@@ -711,7 +925,9 @@ bool connectGsmWithApn(const ApnConfig& cfg) {
   logOk("Conexão 4G ativa em " + String(cfg.operadora));
   logInfo("IP GSM: " + ipStr);
   logATCommand("AT+CGATT?");
+  logATCommand("AT+CGACT?", 2000);
   logATCommand("AT+CGPADDR", 2000);
+  logATCommand("AT+COPS?", 2500);
 
   usingGsm = true;
   usingWifi = false;
@@ -1169,17 +1385,6 @@ bool readGps(double& lat, double& lon) {
     logErr("Campos GNSS insuficientes");
     return false;
   }
-
-  // Formato real observado no seu A7670E:
-  // 0=run status
-  // 1=fix status
-  // 2=UTC vazio em alguns casos
-  // 3=GNSS sats
-  // 4=fix mode
-  // 5=latitude decimal
-  // 6=hemisferio latitude
-  // 7=longitude decimal
-  // 8=hemisferio longitude
 
   String latRaw = fields[5];
   String latHem = fields[6];
