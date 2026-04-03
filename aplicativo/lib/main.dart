@@ -56,11 +56,19 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
   final TextEditingController _topicController = TextEditingController(
     text: 'rastreador',
   );
-
   final TextEditingController _radiusController = TextEditingController(
     text: '500',
   );
   final TextEditingController _phoneController = TextEditingController();
+
+  String _savedHost = '231ccd91865148f78345c07e2d7e799e.s2.eu.hivemq.cloud';
+  String _savedUser = 'rastreador';
+  String _savedPass = 'Extranet1';
+  String _savedTopic = 'rastreador';
+  String _savedRadius = '500';
+  String _savedPhone = '';
+
+  bool _hasPendingConfigChanges = false;
 
   MqttServerClient? client;
   StreamSubscription<List<MqttReceivedMessage<MqttMessage>>>?
@@ -84,6 +92,47 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
 
   final MapController _mapController = MapController();
   final Distance _distance = const Distance();
+
+  @override
+  void initState() {
+    super.initState();
+    _registerConfigListeners();
+    _refreshPendingConfigState();
+  }
+
+  void _registerConfigListeners() {
+    _urlController.addListener(_onConfigChanged);
+    _userController.addListener(_onConfigChanged);
+    _passController.addListener(_onConfigChanged);
+    _topicController.addListener(_onConfigChanged);
+    _radiusController.addListener(_onConfigChanged);
+    _phoneController.addListener(_onConfigChanged);
+  }
+
+  void _onConfigChanged() {
+    _refreshPendingConfigState();
+  }
+
+  void _refreshPendingConfigState() {
+    final hasChanges =
+        _urlController.text.trim() != _savedHost ||
+            _userController.text.trim() != _savedUser ||
+            _passController.text.trim() != _savedPass ||
+            _topicController.text.trim() != _savedTopic ||
+            _radiusController.text.trim() != _savedRadius ||
+            _phoneController.text.trim() != _savedPhone;
+
+    if (!mounted) {
+      _hasPendingConfigChanges = hasChanges;
+      return;
+    }
+
+    if (_hasPendingConfigChanges != hasChanges) {
+      setState(() {
+        _hasPendingConfigChanges = hasChanges;
+      });
+    }
+  }
 
   String _nowTag() {
     return "[${DateTime.now().toIso8601String()}]";
@@ -178,9 +227,7 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
       _subscribeToTopic(topic);
       _startOfflineMonitor();
     } else {
-      _logError(
-        "Falha na conexao MQTT. Status: ${client?.connectionStatus}",
-      );
+      _logError("Falha na conexao MQTT. Status: ${client?.connectionStatus}");
       _showSnackBar(
         "Falha ao conectar. Estado: ${client?.connectionStatus?.state} | "
             "Código: ${client?.connectionStatus?.returnCode}",
@@ -456,7 +503,9 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
             "ALERTA: o tópico $topic está desconectado.\n"
             "Última localização recebida: $lastLocationText";
 
-        _logWarn("Sem coordenadas novas por ${elapsed.inSeconds}s. Disparando alerta.");
+        _logWarn(
+          "Sem coordenadas novas por ${elapsed.inSeconds}s. Disparando alerta.",
+        );
         await _sendWhatsAppAlert(message);
       }
     });
@@ -548,8 +597,17 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
 
     _notificationPhone = _phoneController.text.trim();
 
+    _savedHost = _urlController.text.trim();
+    _savedUser = _userController.text.trim();
+    _savedPass = _passController.text.trim();
+    _savedTopic = _topicController.text.trim();
+    _savedRadius = _radiusController.text.trim();
+    _savedPhone = _phoneController.text.trim();
+
     if (mounted) {
-      setState(() {});
+      setState(() {
+        _hasPendingConfigChanges = false;
+      });
     }
   }
 
@@ -572,6 +630,31 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
     );
 
     _showSnackBar("Centro da área definido com a posição atual");
+  }
+
+  String _getConnectButtonText() {
+    if (_hasPendingConfigChanges) {
+      return 'RECONECTAR SISTEMA';
+    }
+
+    if (isConnected) {
+      return 'CONECTADO';
+    }
+
+    return 'CONECTAR SISTEMA';
+  }
+
+  bool _canPressConnectButton() {
+    if (_hasPendingConfigChanges) {
+      return true;
+    }
+
+    return !isConnected;
+  }
+
+  Future<void> _handleConnectButton() async {
+    Navigator.pop(context);
+    await _connectMqtt();
   }
 
   void _showSnackBar(String msg) {
@@ -616,6 +699,14 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
     _logStep("DISPOSE DA TELA");
     _offlineMonitorTimer?.cancel();
     _disconnectMqtt(showSnack: false);
+
+    _urlController.removeListener(_onConfigChanged);
+    _userController.removeListener(_onConfigChanged);
+    _passController.removeListener(_onConfigChanged);
+    _topicController.removeListener(_onConfigChanged);
+    _radiusController.removeListener(_onConfigChanged);
+    _phoneController.removeListener(_onConfigChanged);
+
     _urlController.dispose();
     _userController.dispose();
     _passController.dispose();
@@ -931,21 +1022,21 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF64FFDA),
+                  disabledBackgroundColor: const Color(0xFF64FFDA)
+                      .withOpacity(0.35),
                   minimumSize: const Size(double.infinity, 60),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(18),
                   ),
                   elevation: 5,
                 ),
-                onPressed: isConnected
-                    ? null
-                    : () {
-                  _applySettingsFromFields();
-                  Navigator.pop(context);
-                  _connectMqtt();
-                },
+                onPressed: _canPressConnectButton()
+                    ? () async {
+                  await _handleConnectButton();
+                }
+                    : null,
                 child: Text(
-                  isConnected ? 'CONECTADO' : 'CONECTAR SISTEMA',
+                  _getConnectButtonText(),
                   style: const TextStyle(
                     color: Color(0xFF0A192F),
                     fontWeight: FontWeight.bold,
@@ -998,7 +1089,7 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
       child: TextField(
         controller: controller,
         obscureText: isPass,
-        keyboardType: isPass ? TextInputType.text : TextInputType.text,
+        keyboardType: TextInputType.text,
         style: const TextStyle(color: Colors.white),
         decoration: InputDecoration(
           labelText: label,
