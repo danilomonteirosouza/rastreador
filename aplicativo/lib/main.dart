@@ -1,12 +1,14 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:mqtt_client/mqtt_client.dart';
 import 'package:mqtt_client/mqtt_server_client.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 void main() {
   runApp(const SubmarineApp());
@@ -55,15 +57,33 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
     text: 'rastreador',
   );
 
+  final TextEditingController _radiusController = TextEditingController(
+    text: '500',
+  );
+  final TextEditingController _phoneController = TextEditingController();
+
   MqttServerClient? client;
   StreamSubscription<List<MqttReceivedMessage<MqttMessage>>>?
   _updatesSubscription;
 
   bool isConnected = false;
   LatLng submarinePos = const LatLng(0, 0);
+  LatLng? _areaCenter;
   String lastRawMessage = "Aguardando telemetria...";
 
+  double _actingRadiusMeters = 500.0;
+  String _notificationPhone = '';
+
+  DateTime? _lastCoordinateAt;
+  Timer? _offlineMonitorTimer;
+
+  bool _outOfAreaAlertSent = false;
+  bool _offlineAlertSent = false;
+
+  static const Duration _offlineThreshold = Duration(seconds: 60);
+
   final MapController _mapController = MapController();
+  final Distance _distance = const Distance();
 
   String _nowTag() {
     return "[${DateTime.now().toIso8601String()}]";
@@ -89,10 +109,12 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
   Future<void> _connectMqtt() async {
     _logStep("INICIO DA CONEXAO MQTT");
 
-    await _disconnectMqtt();
+    await _disconnectMqtt(showSnack: false);
 
     if (!mounted) return;
     setState(() => isConnected = false);
+
+    _applySettingsFromFields();
 
     final host = _urlController.text.trim();
     final user = _userController.text.trim();
@@ -106,6 +128,8 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
     _logInfo("Usuario: $user");
     _logInfo("Topico: $topic");
     _logInfo("ClientId: $clientId");
+    _logInfo("Raio de atuacao: $_actingRadiusMeters m");
+    _logInfo("Telefone notificacao: $_notificationPhone");
 
     client = MqttServerClient.withPort(host, clientId, 8883);
 
@@ -135,7 +159,7 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
       _logError("Excecao ao conectar no broker: $e");
       _logError("Stack trace: $s");
       _showSnackBar("Erro de conexão: $e");
-      await _disconnectMqtt();
+      await _disconnectMqtt(showSnack: false);
       return;
     }
 
@@ -149,7 +173,10 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
       _logInfo("Cliente conectado com sucesso");
       setState(() => isConnected = true);
 
+      _offlineAlertSent = false;
+      _outOfAreaAlertSent = false;
       _subscribeToTopic(topic);
+      _startOfflineMonitor();
     } else {
       _logError(
         "Falha na conexao MQTT. Status: ${client?.connectionStatus}",
@@ -158,7 +185,7 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
         "Falha ao conectar. Estado: ${client?.connectionStatus?.state} | "
             "Código: ${client?.connectionStatus?.returnCode}",
       );
-      await _disconnectMqtt();
+      await _disconnectMqtt(showSnack: false);
     }
   }
 
@@ -201,7 +228,7 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
         }
 
         setState(() => lastRawMessage = payload);
-        _processCoordinates(payload);
+        _processCoordinates(payload, received.topic);
       },
       onError: (error) {
         _logError("Erro no stream de mensagens MQTT: $error");
@@ -214,8 +241,11 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
     );
   }
 
-  Future<void> _disconnectMqtt() async {
+  Future<void> _disconnectMqtt({bool showSnack = true}) async {
     _logStep("PROCESSO DE DESCONEXAO MQTT");
+
+    _offlineMonitorTimer?.cancel();
+    _offlineMonitorTimer = null;
 
     if (_updatesSubscription != null) {
       _logInfo("Cancelando stream de mensagens");
@@ -243,6 +273,10 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
     }
 
     _logInfo("Desconexao concluida");
+
+    if (showSnack) {
+      _showSnackBar("MQTT desconectado");
+    }
   }
 
   void _onSubscribed(String topic) {
@@ -261,6 +295,10 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
 
     if (!mounted) return;
     setState(() => isConnected = true);
+
+    _offlineAlertSent = false;
+    _startOfflineMonitor();
+
     _showSnackBar("Conectado ao broker com sucesso");
   }
 
@@ -272,12 +310,16 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
           "codigo: ${client?.connectionStatus?.returnCode}",
     );
 
+    _offlineMonitorTimer?.cancel();
+    _offlineMonitorTimer = null;
+
     if (!mounted) return;
     setState(() => isConnected = false);
+
     _showSnackBar("MQTT desconectado");
   }
 
-  void _processCoordinates(String message) {
+  void _processCoordinates(String message, String topic) {
     _logStep("PROCESSAMENTO DE COORDENADAS");
     _logInfo("Mensagem recebida para parsing: $message");
 
@@ -297,12 +339,12 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
         _logInfo("Latitude extraida: $lat");
         _logInfo("Longitude extraida: $lng");
 
-        _updateMapPosition(LatLng(lat, lng));
+        _handleValidCoordinate(LatLng(lat, lng), topic);
         return;
       }
 
       _logWarn("Regex principal nao encontrou latitude/longitude");
-      _processFallback(message);
+      _processFallback(message, topic);
     } catch (e, s) {
       _logError("Erro no processamento das coordenadas: $e");
       _logError("Stack trace: $s");
@@ -310,7 +352,7 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
     }
   }
 
-  void _processFallback(String message) {
+  void _processFallback(String message, String topic) {
     _logStep("FALLBACK DE PARSING");
     _logInfo("Tentando fallback com a mensagem: $message");
 
@@ -326,7 +368,7 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
         _logInfo("Latitude JSON: $lat");
         _logInfo("Longitude JSON: $lng");
 
-        _updateMapPosition(LatLng(lat, lng));
+        _handleValidCoordinate(LatLng(lat, lng), topic);
         return;
       }
 
@@ -342,7 +384,7 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
         _logInfo("Latitude fallback simples: $lat");
         _logInfo("Longitude fallback simples: $lng");
 
-        _updateMapPosition(LatLng(lat, lng));
+        _handleValidCoordinate(LatLng(lat, lng), topic);
         return;
       }
 
@@ -351,6 +393,22 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
       _logError("Erro no fallback de parsing: $e");
       _logError("Stack trace: $s");
     }
+  }
+
+  void _handleValidCoordinate(LatLng pos, String topic) {
+    _lastCoordinateAt = DateTime.now();
+    _offlineAlertSent = false;
+
+    if (_areaCenter == null) {
+      _areaCenter = pos;
+      _logInfo(
+        "Centro da area de atuacao definido na primeira coordenada: "
+            "${pos.latitude}, ${pos.longitude}",
+      );
+    }
+
+    _updateMapPosition(pos);
+    _checkAreaStatus(pos, topic);
   }
 
   void _updateMapPosition(LatLng pos) {
@@ -379,6 +437,143 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
     }
   }
 
+  void _startOfflineMonitor() {
+    _offlineMonitorTimer?.cancel();
+
+    _offlineMonitorTimer = Timer.periodic(const Duration(seconds: 5), (_) async {
+      if (!isConnected) return;
+      if (_lastCoordinateAt == null) return;
+
+      final elapsed = DateTime.now().difference(_lastCoordinateAt!);
+
+      if (elapsed >= _offlineThreshold && !_offlineAlertSent) {
+        _offlineAlertSent = true;
+
+        final topic = _topicController.text.trim();
+        final lastLocationText = _formatLatLng(submarinePos);
+
+        final message =
+            "ALERTA: o tópico $topic está desconectado.\n"
+            "Última localização recebida: $lastLocationText";
+
+        _logWarn("Sem coordenadas novas por ${elapsed.inSeconds}s. Disparando alerta.");
+        await _sendWhatsAppAlert(message);
+      }
+    });
+  }
+
+  void _checkAreaStatus(LatLng pos, String topic) {
+    if (_areaCenter == null || _actingRadiusMeters <= 0) {
+      _logWarn("Area de atuacao nao configurada para validacao");
+      return;
+    }
+
+    final distanceMeters = _distance.as(LengthUnit.Meter, _areaCenter!, pos);
+
+    _logInfo(
+      "Distancia ate o centro da area: ${distanceMeters.toStringAsFixed(2)} m | "
+          "Raio configurado: ${_actingRadiusMeters.toStringAsFixed(2)} m",
+    );
+
+    if (distanceMeters > _actingRadiusMeters) {
+      if (!_outOfAreaAlertSent) {
+        _outOfAreaAlertSent = true;
+
+        final message =
+            "ALERTA: o tópico $topic saiu da área de atuação.\n"
+            "Localização atual: ${_formatLatLng(pos)}\n"
+            "Centro da área: ${_formatLatLng(_areaCenter!)}\n"
+            "Distância do centro: ${distanceMeters.toStringAsFixed(1)} m\n"
+            "Raio configurado: ${_actingRadiusMeters.toStringAsFixed(1)} m";
+
+        _sendWhatsAppAlert(message);
+      }
+    } else {
+      if (_outOfAreaAlertSent) {
+        _logInfo("Tópico voltou para dentro da área de atuação");
+      }
+      _outOfAreaAlertSent = false;
+    }
+  }
+
+  Future<void> _sendWhatsAppAlert(String message) async {
+    final phone = _sanitizePhone(_notificationPhone);
+
+    if (phone.isEmpty) {
+      _logWarn("Telefone de notificacao nao configurado");
+      _showSnackBar("Defina o telefone de notificação para enviar alertas");
+      return;
+    }
+
+    final encodedMessage = Uri.encodeComponent(message);
+    final webUrl = Uri.parse("https://wa.me/$phone?text=$encodedMessage");
+
+    _logStep("ENVIO DE ALERTA WHATSAPP");
+    _logInfo("Telefone: $phone");
+    _logInfo("Mensagem: $message");
+
+    try {
+      final ok = await launchUrl(
+        webUrl,
+        mode: LaunchMode.externalApplication,
+      );
+
+      if (!ok) {
+        _logWarn("Nao foi possivel abrir o WhatsApp");
+        _showSnackBar("Não foi possível abrir o WhatsApp");
+      }
+    } catch (e) {
+      _logError("Erro ao abrir WhatsApp: $e");
+      _showSnackBar("Erro ao abrir WhatsApp: $e");
+    }
+  }
+
+  String _sanitizePhone(String phone) {
+    return phone.replaceAll(RegExp(r'[^0-9]'), '');
+  }
+
+  String _formatLatLng(LatLng pos) {
+    return "latitude: ${pos.latitude.toStringAsFixed(7)}, "
+        "longitude: ${pos.longitude.toStringAsFixed(7)}";
+  }
+
+  void _applySettingsFromFields() {
+    final parsedRadius = double.tryParse(
+      _radiusController.text.trim().replaceAll(',', '.'),
+    );
+
+    _actingRadiusMeters = (parsedRadius != null && parsedRadius > 0)
+        ? parsedRadius
+        : 500.0;
+
+    _notificationPhone = _phoneController.text.trim();
+
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  void _defineAreaCenterFromCurrentPosition() {
+    _applySettingsFromFields();
+
+    if (submarinePos.latitude == 0 && submarinePos.longitude == 0) {
+      _showSnackBar("Ainda não há posição válida para definir o centro");
+      return;
+    }
+
+    setState(() {
+      _areaCenter = submarinePos;
+      _outOfAreaAlertSent = false;
+    });
+
+    _logInfo(
+      "Centro da area redefinido para posição atual: "
+          "${submarinePos.latitude}, ${submarinePos.longitude}",
+    );
+
+    _showSnackBar("Centro da área definido com a posição atual");
+  }
+
   void _showSnackBar(String msg) {
     _logInfo("SnackBar: $msg");
 
@@ -388,19 +583,54 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
     );
   }
 
+  List<LatLng> _buildCirclePoints(
+      LatLng center,
+      double radiusMeters, {
+        int pointsCount = 120,
+      }) {
+    final List<LatLng> points = [];
+
+    final latRad = center.latitude * math.pi / 180.0;
+    final metersPerDegreeLat = 111320.0;
+    final metersPerDegreeLng = 111320.0 * math.cos(latRad);
+
+    for (int i = 0; i <= pointsCount; i++) {
+      final theta = (2 * math.pi * i) / pointsCount;
+
+      final dx = radiusMeters * math.cos(theta);
+      final dy = radiusMeters * math.sin(theta);
+
+      final dLat = dy / metersPerDegreeLat;
+      final dLng = dx / metersPerDegreeLng;
+
+      points.add(
+        LatLng(center.latitude + dLat, center.longitude + dLng),
+      );
+    }
+
+    return points;
+  }
+
   @override
   void dispose() {
     _logStep("DISPOSE DA TELA");
-    _disconnectMqtt();
+    _offlineMonitorTimer?.cancel();
+    _disconnectMqtt(showSnack: false);
     _urlController.dispose();
     _userController.dispose();
     _passController.dispose();
     _topicController.dispose();
+    _radiusController.dispose();
+    _phoneController.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
+    final circlePoints = (_areaCenter != null && _actingRadiusMeters > 0)
+        ? _buildCirclePoints(_areaCenter!, _actingRadiusMeters)
+        : <LatLng>[];
+
     return Scaffold(
       appBar: AppBar(
         title: const Text(
@@ -450,8 +680,30 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
                       'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
                       userAgentPackageName: 'com.example.rastreador',
                     ),
+                    if (circlePoints.isNotEmpty)
+                      PolygonLayer(
+                        polygons: [
+                          Polygon(
+                            points: circlePoints,
+                            color: Colors.cyan.withOpacity(0.15),
+                            borderColor: Colors.cyanAccent,
+                            borderStrokeWidth: 2,
+                          ),
+                        ],
+                      ),
                     MarkerLayer(
                       markers: [
+                        if (_areaCenter != null)
+                          Marker(
+                            point: _areaCenter!,
+                            width: 60,
+                            height: 60,
+                            child: const Icon(
+                              Icons.radio_button_checked,
+                              size: 24,
+                              color: Colors.yellow,
+                            ),
+                          ),
                         Marker(
                           point: submarinePos,
                           width: 80,
@@ -528,19 +780,37 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
                       ),
                     ],
                   ),
-                  const SizedBox(height: 20),
+                  const SizedBox(height: 14),
                   Row(
                     children: [
                       _buildCoordItem(
                         "LATITUDE",
                         submarinePos.latitude.toStringAsFixed(7),
                       ),
-                      const SizedBox(width: 40),
+                      const SizedBox(width: 28),
                       _buildCoordItem(
                         "LONGITUDE",
                         submarinePos.longitude.toStringAsFixed(7),
                       ),
                     ],
+                  ),
+                  const SizedBox(height: 10),
+                  Text(
+                    'RAIO: ${_actingRadiusMeters.toStringAsFixed(0)} m',
+                    style: const TextStyle(
+                      color: Colors.white70,
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  Text(
+                    _areaCenter != null
+                        ? 'CENTRO: ${_areaCenter!.latitude.toStringAsFixed(5)}, ${_areaCenter!.longitude.toStringAsFixed(5)}'
+                        : 'CENTRO: não definido',
+                    style: const TextStyle(
+                      color: Colors.white54,
+                      fontSize: 11,
+                    ),
                   ),
                   const Spacer(),
                   Text(
@@ -625,7 +895,39 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
               _buildField(_userController, 'Usuário', Icons.account_circle),
               _buildField(_passController, 'Senha', Icons.vpn_key, isPass: true),
               _buildField(_topicController, 'Tópico de Escuta', Icons.sensors),
-              const SizedBox(height: 30),
+              _buildField(
+                _radiusController,
+                'Raio de atuação (metros)',
+                Icons.radar,
+              ),
+              _buildField(
+                _phoneController,
+                'Telefone de notificação (com DDI)',
+                Icons.phone_android,
+              ),
+              const SizedBox(height: 8),
+              ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.orange,
+                  minimumSize: const Size(double.infinity, 54),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(18),
+                  ),
+                ),
+                onPressed: () {
+                  Navigator.pop(context);
+                  _defineAreaCenterFromCurrentPosition();
+                },
+                icon: const Icon(Icons.my_location, color: Colors.black),
+                label: const Text(
+                  'USAR POSIÇÃO ATUAL COMO CENTRO',
+                  style: TextStyle(
+                    color: Colors.black,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 18),
               ElevatedButton(
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFF64FFDA),
@@ -638,6 +940,7 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
                 onPressed: isConnected
                     ? null
                     : () {
+                  _applySettingsFromFields();
                   Navigator.pop(context);
                   _connectMqtt();
                 },
@@ -695,6 +998,7 @@ class _MainCommandCenterState extends State<MainCommandCenter> {
       child: TextField(
         controller: controller,
         obscureText: isPass,
+        keyboardType: isPass ? TextInputType.text : TextInputType.text,
         style: const TextStyle(color: Colors.white),
         decoration: InputDecoration(
           labelText: label,
